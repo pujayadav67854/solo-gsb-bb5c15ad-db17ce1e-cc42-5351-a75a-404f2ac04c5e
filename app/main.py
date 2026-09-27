@@ -14,6 +14,7 @@ from .audit import run_audit
 from .chokepoint_audit import run_dependency_chokepoints
 from .diagnose import run_root_conflict_diagnosis
 from .environment_matrix import parse_environments, run_environment_matrix
+from .graph_fingerprints import run_graph_fingerprints
 from .license_audit import run_license_audit
 from .jobs import (
     CANCELLED,
@@ -146,6 +147,18 @@ class DependencyChokepointsRequest(BaseModel):
     )
 
 
+class GraphFingerprintsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    dependency_graph: list[GraphEdgeInput] = Field(
+        default_factory=list,
+        description="Edges as returned by /resolve.",
+    )
+
+
 class RebuildPlanRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -216,7 +229,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.6.0",
+    version="1.7.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -385,6 +398,28 @@ async def dependency_chokepoints_endpoint(
     body = run_dependency_chokepoints(
         payload.resolved, payload.dependency_graph
     )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/audit/graph-fingerprints")
+async def graph_fingerprints_endpoint(
+    payload: GraphFingerprintsRequest,
+) -> JSONResponse:
+    """Fingerprint the dependency closure of ``<root>`` and every package.
+
+    Takes the ``resolved`` mapping and ``dependency_graph`` edges from a
+    successful ``/resolve`` response.  For ``<root>`` and every resolved
+    package, the full reachable dependency closure — canonical package
+    names, PEP 440 normalized versions and deduplicated directed edges — is
+    serialized deterministically and hashed with SHA-256.  Nodes in cycles
+    or diamonds are counted exactly once, the insertion order of
+    ``resolved`` and the order/duplication of input edges cannot affect the
+    result, and any version or edge change inside a closure changes the
+    fingerprints of exactly the nodes that can reach it.  Packages that are
+    resolved but unreachable from ``<root>`` are still fingerprinted over
+    their own closure and are additionally listed under ``unreachable``.
+    """
+    body = run_graph_fingerprints(payload.resolved, payload.dependency_graph)
     return JSONResponse(status_code=200, content=body)
 
 
