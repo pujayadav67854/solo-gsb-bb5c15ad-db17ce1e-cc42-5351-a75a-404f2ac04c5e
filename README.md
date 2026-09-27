@@ -53,6 +53,12 @@
   菱形结构的有向图上找出每个可达包的**必经依赖**（支配者，任一路径都无法绕过）；
   再按每个必经包汇总其**独占支配**的下游包（支配树后代）及数量，结果稳定排序，
   `<root>` 不可达的包单列。
+- **依赖图指纹审计**：`POST /audit/graph-fingerprints` 接收 `/resolve` 成功响应
+  中的 `resolved` 与 `dependency_graph`，为 `<root>` 与每个已解析包计算
+  **SHA-256 指纹**：按规范包名、PEP 440 规范版本与去重后的有向边，对各自可达的
+  **完整依赖闭包**做确定性序列化。环与菱形结构中的节点只计一次，输入映射顺序与
+  边顺序（含重复边）不影响结果；闭包内的版本或边变化会改变所有能到达它的节点的
+  指纹。响应返回根指纹、按包名排序的包指纹及根不可达包列表。
 - **环境矩阵分析**：`POST /analyze/environment-matrix` 接收与 `/resolve` 相同的
   `packages`、`root`、`locks`、`allow_prereleases`、`max_attempts`，外加 2～8 个
   名称唯一的环境（各自带 `marker_env`），对每个环境**独立**解析同一组根需求与
@@ -75,6 +81,7 @@ docker compose up --build
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
 - `POST /audit/dependency-chokepoints` — 审计依赖图的必经依赖（支配者/关键节点）
+- `POST /audit/graph-fingerprints` — 计算 `<root>` 与每个包的依赖闭包 SHA-256 指纹
 - `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
 - `POST /analyze/environment-matrix` — 在多个标记环境下独立解析并汇总版本矩阵
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
@@ -316,6 +323,82 @@ curl -s -X POST localhost:8000/audit/dependency-chokepoints \
   视为悬空边；
 - 边的 `source_version` / `target_version` 必须与 `resolved` 中对应版本一致
   （`<root>` 边的 `source_version` 必须为空）。
+
+## 依赖图指纹审计 API
+
+`POST /audit/graph-fingerprints` 接收 `/resolve` **成功响应**中的 `resolved` 与
+`dependency_graph`，为 `<root>` 和每个已解析包计算 **SHA-256 内容指纹**。每个
+节点的指纹覆盖从它出发可达的**完整依赖闭包**：闭包内每个节点贡献其规范包名与
+PEP 440 规范版本，闭包成员之间的每条有向边（去重后）贡献一条记录，整体按确定性
+规则序列化后取 SHA-256。
+
+- 闭包是**集合**而非遍历顺序：环与菱形结构中的节点只计一次，`resolved` 映射顺序
+  与边的给出顺序（含重复边）都不影响结果，相同图永远得到相同指纹。
+- 闭包内任何版本或边变化，会改变**所有能到达它**的节点的指纹（根指纹随之变化）；
+  闭包之外的变化（例如根不可达包自身的改动）不影响其他指纹。
+- 包名先规范化（`Foo_Bar` 与 `foo-bar` 相同），版本先按 PEP 440 规范化
+  （`01.0` 与 `1.0` 相同）再参与哈希。
+
+```bash
+curl -s -X POST localhost:8000/audit/graph-fingerprints \
+  -H 'Content-Type: application/json' -d '{
+  "resolved": {"app": "1.0", "db": "1.0", "web": "2.0", "common": "1.5"},
+  "dependency_graph": [
+    {"source": "<root>", "source_version": "", "target": "app", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "db", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "web", "target_version": "2.0"},
+    {"source": "db", "source_version": "1.0", "target": "common", "target_version": "1.5"},
+    {"source": "web", "source_version": "2.0", "target": "common", "target_version": "1.5"}
+  ]
+}'
+```
+
+请求字段：
+
+- `resolved`：包名 → 已解析版本（PEP 440），即 `/resolve` 的 `resolved`。
+- `dependency_graph`：边列表，即 `/resolve` 的 `dependency_graph`；校验口径与
+  漏洞审计完全一致（无悬空边、版本必须与 `resolved` 一致、`<root>` 边的
+  `source_version` 必须为空）。
+
+响应（200，以上述菱形为例）：
+
+```json
+{
+  "status": "ok",
+  "algorithm": "sha256",
+  "summary": {"packages": 4, "reachable": 4, "unreachable": 0},
+  "root": {
+    "name": "<root>",
+    "fingerprint": "89d2372165f6495b301e48b74d3bb66a9e5fa9cc29f79e5003592dd7f65c1d6c"
+  },
+  "packages": [
+    {"package": "app", "version": "1.0",
+     "fingerprint": "9505110f46c486ee3e149f1e87470b9282854f1e89124e607df1a668eb727a16"},
+    {"package": "common", "version": "1.5",
+     "fingerprint": "f28beeb33b2fb9dbd851ced8faecda90fd7b419db5545598579e0a61577792e4"},
+    {"package": "db", "version": "1.0",
+     "fingerprint": "d7dea032fd96e93b9915a65dd5c5cb5c0a404fd3254b39e93235cb38364efdf3"},
+    {"package": "web", "version": "2.0",
+     "fingerprint": "be8c118a7cc613b40cb1804715503ad10fd7db639f624c65076f1e05d95890fb"}
+  ],
+  "unreachable": []
+}
+```
+
+- `root`：`<root>` 的指纹，覆盖全部可达包及其间的边；根闭包内任何变化都会
+  改变它，可整树比对两次解析结果。
+- `packages`：每个已解析包一项（按包名排序），`fingerprint` 覆盖该包自身的
+  依赖闭包；上例中 `common` 的闭包只有它自己，而 `db` 与 `web` 的闭包各自
+  包含 `common`。
+- `unreachable`：已解析但 `<root>` 不可达的包（带版本，按包名排序），单列以便
+  人工核查；它们仍会在 `packages` 中获得自身闭包的指纹。
+- 指纹的确定性序列化形式为紧凑 JSON（键排序、无空白）：
+  `{"nodes": [[名称, 版本], ...], "edges": [[源, 源版本, 目标, 目标版本], ...]}`，
+  节点与边各自排序后取 SHA-256 十六进制摘要。
+
+校验规则（违反即返回 `400`，错误体与 `/resolve` 相同）：与漏洞审计、关键节点
+审计共用同一套图一致性校验——`resolved` 版本必须合法 PEP 440、包名规范化后不得
+重复、`<root>` 为保留名、无悬空边、边版本必须与 `resolved` 一致。
 
 ## 许可证审计 API
 
@@ -829,11 +912,12 @@ app/
   environment_matrix.py # 环境矩阵：多标记环境独立求解、成功环境版本矩阵与差异汇总
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   chokepoint_audit.py # 关键节点审计：可达性、支配者不动点、支配树与独占支配汇总
+  graph_fingerprints.py # 指纹审计：依赖闭包的确定性序列化与 SHA-256 指纹
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
   rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
   main.py           # FastAPI 应用与 /resolve、/diagnose/root-conflict、/audit/*、/plan/rebuild、/analyze/environment-matrix、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞、关键节点、许可证审计、重建计划与环境矩阵）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+tests/              # 端到端 API 测试（含漏洞、关键节点、指纹、许可证审计、重建计划与环境矩阵）、根冲突诊断测试（含随机暴力对照）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml
